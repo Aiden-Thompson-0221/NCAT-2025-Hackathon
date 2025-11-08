@@ -1,0 +1,612 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Hand Tracking - Surgical Robot</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Hand Model with Forward Kinematics
+        class HandModel {
+            constructor() {
+                // Segment lengths in cm
+                this.lengths = {
+                    thumb: [3.0, 2.2],
+                    index: [4.5, 2.8, 2.0],
+                    middle: [5.0, 3.0, 2.2],
+                    ring: [4.3, 2.6, 1.9],
+                    pinky: [3.2, 2.0, 1.6]
+                };
+
+                // Base positions relative to wrist
+                this.basePos = {
+                    thumb: [-2.0, 1.6, -0.2],
+                    index: [-1.5, 4.2, 0.0],
+                    middle: [0.0, 4.4, 0.2],
+                    ring: [1.5, 4.2, 0.0],
+                    pinky: [3.0, 3.7, -0.1]
+                };
+
+                // Fan angles
+                this.fanAngles = {
+                    thumb: -25 * Math.PI / 180,
+                    index: 10 * Math.PI / 180,
+                    middle: 0,
+                    ring: -10 * Math.PI / 180,
+                    pinky: -20 * Math.PI / 180
+                };
+
+                // Max flexion angles
+                this.maxFlex = {
+                    thumb: [55, 70, 65],
+                    index: [85, 105, 80],
+                    middle: [90, 110, 85],
+                    ring: [85, 100, 75],
+                    pinky: [80, 95, 70]
+                };
+            }
+
+            rotX(theta) {
+                const c = Math.cos(theta);
+                const s = Math.sin(theta);
+                return [
+                    [1, 0, 0, 0],
+                    [0, c, -s, 0],
+                    [0, s, c, 0],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            rotZ(theta) {
+                const c = Math.cos(theta);
+                const s = Math.sin(theta);
+                return [
+                    [c, -s, 0, 0],
+                    [s, c, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            translate(x, y, z) {
+                return [
+                    [1, 0, 0, x],
+                    [0, 1, 0, y],
+                    [0, 0, 1, z],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            matMul(a, b) {
+                const result = Array(4).fill(0).map(() => Array(4).fill(0));
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        for (let k = 0; k < 4; k++) {
+                            result[i][j] += a[i][k] * b[k][j];
+                        }
+                    }
+                }
+                return result;
+            }
+
+            transformPoint(mat, point) {
+                const [x, y, z] = point;
+                return [
+                    mat[0][0] * x + mat[0][1] * y + mat[0][2] * z + mat[0][3],
+                    mat[1][0] * x + mat[1][1] * y + mat[1][2] * z + mat[1][3],
+                    mat[2][0] * x + mat[2][1] * y + mat[2][2] * z + mat[2][3]
+                ];
+            }
+
+            calculateFinger(fingerName, flexAmount) {
+                const positions = [];
+                const base = this.basePos[fingerName];
+                const lengths = this.lengths[fingerName];
+                const fanAngle = this.fanAngles[fingerName];
+                const maxAngles = this.maxFlex[fingerName];
+
+                // Start at base with fan angle
+                let T = this.matMul(this.translate(...base), this.rotZ(fanAngle));
+                positions.push([T[0][3], T[1][3], T[2][3]]);
+
+                const isThumb = fingerName === 'thumb';
+                
+                if (isThumb) {
+                    // Thumb: opposition, MCP, IP
+                    const angles = maxAngles.map(a => a * Math.PI / 180 * flexAmount);
+                    T = this.matMul(T, this.rotZ(angles[0]));
+                    T = this.matMul(T, this.rotX(angles[1]));
+                    T = this.matMul(T, this.translate(0, lengths[0], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[2]));
+                    T = this.matMul(T, this.translate(0, lengths[1], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                } else {
+                    // Regular finger: MCP, PIP, DIP
+                    const angles = [
+                        maxAngles[0] * Math.PI / 180 * flexAmount * 0.75,
+                        maxAngles[1] * Math.PI / 180 * flexAmount * 1.0,
+                        maxAngles[2] * Math.PI / 180 * flexAmount * 0.85
+                    ];
+                    
+                    T = this.matMul(T, this.rotX(angles[0]));
+                    T = this.matMul(T, this.translate(0, lengths[0], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[1]));
+                    T = this.matMul(T, this.translate(0, lengths[1], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[2]));
+                    T = this.matMul(T, this.translate(0, lengths[2], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                }
+
+                return positions;
+            }
+
+            getAllFingers(flexAmount) {
+                return {
+                    thumb: this.calculateFinger('thumb', flexAmount),
+                    index: this.calculateFinger('index', flexAmount),
+                    middle: this.calculateFinger('middle', flexAmount),
+                    ring: this.calculateFinger('ring', flexAmount),
+                    pinky: this.calculateFinger('pinky', flexAmount)
+                };
+            }
+        }
+
+        const HandTracking3D = () => {
+            const [robotState, setRobotState] = useState({
+                joints: [0, 0, 0, 0, 0, 0],
+                cartesian: { x: 0, y: 200, z: 300 },
+                gripperOpen: 50,
+            });
+
+            const [systemState, setSystemState] = useState({
+                status: 'Ready',
+                emergencyStop: false,
+                clutched: false,
+            });
+
+            const [webcamActive, setWebcamActive] = useState(false);
+            const [handDetected, setHandDetected] = useState(false);
+            const [flexAmount, setFlexAmount] = useState(0);
+            const [handPosition, setHandPosition] = useState([0, 0, 0]);
+
+            const handCanvasRef = useRef(null);
+            const hand3DRef = useRef(null);
+            const videoRef = useRef(null);
+            const robotCanvasRef = useRef(null);
+            const videoStreamRef = useRef(null);
+            const handTrackingRef = useRef(null);
+            const basePositionRef = useRef(null);
+            const handModelRef = useRef(new HandModel());
+
+            useEffect(() => {
+                if (webcamActive) {
+                    startWebcam();
+                } else {
+                    stopWebcam();
+                }
+                return () => stopWebcam();
+            }, [webcamActive]);
+
+            const startWebcam = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: 640, height: 480, facingMode: 'user' }
+                    });
+                    
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                        videoStreamRef.current = stream;
+                        videoRef.current.onloadedmetadata = () => {
+                            videoRef.current.play().then(() => {
+                                trackHandFromVideo();
+                            });
+                        };
+                    }
+                } catch (err) {
+                    alert('Could not access webcam. Please allow camera permissions.');
+                    setWebcamActive(false);
+                }
+            };
+
+            const stopWebcam = () => {
+                if (videoStreamRef.current) {
+                    videoStreamRef.current.getTracks().forEach(track => track.stop());
+                    videoStreamRef.current = null;
+                }
+                if (handTrackingRef.current) {
+                    cancelAnimationFrame(handTrackingRef.current);
+                    handTrackingRef.current = null;
+                }
+            };
+
+            const trackHandFromVideo = () => {
+                const video = videoRef.current;
+                const canvas = handCanvasRef.current;
+                
+                if (!video || !canvas) return;
+
+                const ctx = canvas.getContext('2d');
+                
+                const processFrame = () => {
+                    if (!webcamActive || !videoRef.current) return;
+
+                    try {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const pixels = imageData.data;
+                        
+                        let skinPixels = [];
+                        for (let i = 0; i < pixels.length; i += 4) {
+                            const r = pixels[i];
+                            const g = pixels[i + 1];
+                            const b = pixels[i + 2];
+                            
+                            if (r > 95 && g > 40 && b > 20 && r > g && r > b && Math.abs(r - g) > 15) {
+                                const x = (i / 4) % canvas.width;
+                                const y = Math.floor((i / 4) / canvas.width);
+                                skinPixels.push({ x, y });
+                            }
+                        }
+                        
+                        if (skinPixels.length > 1000) {
+                            setHandDetected(true);
+                            
+                            let sumX = 0, sumY = 0;
+                            skinPixels.forEach(p => {
+                                sumX += p.x;
+                                sumY += p.y;
+                            });
+                            const centerX = sumX / skinPixels.length;
+                            const centerY = sumY / skinPixels.length;
+                            
+                            ctx.strokeStyle = '#00ff00';
+                            ctx.lineWidth = 3;
+                            ctx.beginPath();
+                            ctx.arc(centerX, centerY, 30, 0, Math.PI * 2);
+                            ctx.stroke();
+                            
+                            const normalizedX = centerX / canvas.width;
+                            const normalizedY = centerY / canvas.height;
+                            
+                            const handArea = skinPixels.length;
+                            const currentFlex = Math.max(0, Math.min(1, 1 - (handArea / 8000)));
+                            setFlexAmount(currentFlex);
+                            
+                            processHandPosition(normalizedX, normalizedY, currentFlex);
+                        } else {
+                            setHandDetected(false);
+                        }
+                    } catch (err) {
+                        console.error('Error processing frame:', err);
+                    }
+                    
+                    handTrackingRef.current = requestAnimationFrame(processFrame);
+                };
+                
+                if (video.readyState >= 2) {
+                    processFrame();
+                } else {
+                    setTimeout(() => trackHandFromVideo(), 100);
+                }
+            };
+
+            const processHandPosition = (x, y, flex) => {
+                if (systemState.emergencyStop) return;
+
+                if (!basePositionRef.current || systemState.clutched) {
+                    basePositionRef.current = { x, y };
+                    return;
+                }
+
+                const deltaX = (x - basePositionRef.current.x) * 500;
+                const deltaY = -(y - basePositionRef.current.y) * 500;
+
+                const newCart = {
+                    x: Math.max(-400, Math.min(400, deltaX)),
+                    y: Math.max(0, Math.min(400, 200 + deltaY)),
+                    z: 300
+                };
+
+                const distance = Math.sqrt(newCart.x ** 2 + (newCart.y - 200) ** 2);
+                const angle = Math.atan2(newCart.y - 200, newCart.x);
+                
+                const newJoints = [...robotState.joints];
+                newJoints[0] = angle * 180 / Math.PI;
+                newJoints[1] = Math.max(-90, Math.min(90, (distance - 200) / 3));
+
+                setRobotState(prev => ({
+                    ...prev,
+                    cartesian: newCart,
+                    joints: newJoints,
+                    gripperOpen: (1 - flex) * 80 + 10
+                }));
+
+                setHandPosition([deltaX / 50, deltaY / 50, 0]);
+            };
+
+            // Draw 3D Hand
+            useEffect(() => {
+                const canvas = hand3DRef.current;
+                if (!canvas) return;
+
+                const ctx = canvas.getContext('2d');
+                const width = canvas.width;
+                const height = canvas.height;
+
+                const draw3DFrame = () => {
+                    ctx.fillStyle = '#0a0a1a';
+                    ctx.fillRect(0, 0, width, height);
+
+                    // Draw grid
+                    ctx.strokeStyle = '#1a1a3a';
+                    ctx.lineWidth = 1;
+                    for (let i = 0; i < width; i += 40) {
+                        ctx.beginPath();
+                        ctx.moveTo(i, 0);
+                        ctx.lineTo(i, height);
+                        ctx.stroke();
+                    }
+                    for (let i = 0; i < height; i += 40) {
+                        ctx.beginPath();
+                        ctx.moveTo(0, i);
+                        ctx.lineTo(width, i);
+                        ctx.stroke();
+                    }
+
+                    // Get hand model positions
+                    const fingers = handModelRef.current.getAllFingers(flexAmount);
+                    
+                    const scale = 15;
+                    const offsetX = width / 2 + handPosition[0];
+                    const offsetY = height / 2 - handPosition[1];
+
+                    // Draw palm
+                    ctx.strokeStyle = '#4a4a8a';
+                    ctx.lineWidth = 3;
+                    ctx.fillStyle = '#2a2a5a';
+                    ctx.beginPath();
+                    const palmPoints = [
+                        [-3.5, 1.0], [-3.5, 3.0], [3.5, 3.0], [3.5, 1.0]
+                    ];
+                    palmPoints.forEach(([x, y], i) => {
+                        const sx = offsetX + x * scale;
+                        const sy = offsetY - y * scale;
+                        if (i === 0) ctx.moveTo(sx, sy);
+                        else ctx.lineTo(sx, sy);
+                    });
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+
+                    // Draw wrist
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(offsetX, offsetY, 8, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Draw fingers
+                    const colors = ['#ff4444', '#4444ff', '#44ff44', '#ffaa44', '#aa44ff'];
+                    const fingerNames = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+                    
+                    fingerNames.forEach((name, idx) => {
+                        const positions = fingers[name];
+                        ctx.strokeStyle = colors[idx];
+                        ctx.lineWidth = 4;
+                        ctx.lineCap = 'round';
+                        ctx.lineJoin = 'round';
+
+                        ctx.beginPath();
+                        positions.forEach(([x, y, z], i) => {
+                            const sx = offsetX + x * scale;
+                            const sy = offsetY - y * scale;
+                            if (i === 0) ctx.moveTo(sx, sy);
+                            else ctx.lineTo(sx, sy);
+                        });
+                        ctx.stroke();
+
+                        // Draw joints
+                        positions.forEach(([x, y, z]) => {
+                            const sx = offsetX + x * scale;
+                            const sy = offsetY - y * scale;
+                            ctx.fillStyle = colors[idx];
+                            ctx.beginPath();
+                            ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.strokeStyle = '#ffffff';
+                            ctx.lineWidth = 2;
+                            ctx.stroke();
+                        });
+                    });
+
+                    requestAnimationFrame(draw3DFrame);
+                };
+
+                draw3DFrame();
+            }, [flexAmount, handPosition]);
+
+            // Draw Robot
+            useEffect(() => {
+                const canvas = robotCanvasRef.current;
+                if (!canvas) return;
+
+                const armSegments = [100, 150, 120, 80];
+
+                const drawRobot = () => {
+                    const ctx = canvas.getContext('2d');
+                    const width = canvas.width;
+                    const height = canvas.height;
+
+                    ctx.fillStyle = '#1a1a2e';
+                    ctx.fillRect(0, 0, width, height);
+
+                    const baseX = width / 2;
+                    const baseY = height - 50;
+
+                    ctx.fillStyle = '#4a4a6a';
+                    ctx.fillRect(baseX - 30, baseY - 10, 60, 20);
+
+                    const rad = robotState.joints.map(j => j * Math.PI / 180);
+                    let currentX = baseX;
+                    let currentY = baseY;
+                    let currentAngle = 0;
+                    const jointPositions = [[currentX, currentY]];
+
+                    for (let i = 0; i < 4; i++) {
+                        currentAngle += rad[i];
+                        currentX += armSegments[i] * Math.cos(currentAngle);
+                        currentY -= armSegments[i] * Math.sin(currentAngle);
+                        jointPositions.push([currentX, currentY]);
+                    }
+
+                    ctx.strokeStyle = '#00d4ff';
+                    ctx.lineWidth = 8;
+                    ctx.lineCap = 'round';
+
+                    for (let i = 0; i < jointPositions.length - 1; i++) {
+                        ctx.beginPath();
+                        ctx.moveTo(jointPositions[i][0], jointPositions[i][1]);
+                        ctx.lineTo(jointPositions[i + 1][0], jointPositions[i + 1][1]);
+                        ctx.stroke();
+                    }
+
+                    jointPositions.forEach((pos, idx) => {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.beginPath();
+                        ctx.arc(pos[0], pos[1], idx === 0 ? 12 : 8, 0, Math.PI * 2);
+                        ctx.fill();
+                    });
+
+                    const endPos = jointPositions[jointPositions.length - 1];
+                    const gripperAngle = currentAngle;
+                    const gripperLength = 30;
+                    const gripperWidth = robotState.gripperOpen / 100 * 20;
+
+                    ctx.strokeStyle = flexAmount > 0.5 ? '#ff4444' : '#44ff44';
+                    ctx.lineWidth = 4;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(endPos[0], endPos[1]);
+                    ctx.lineTo(
+                        endPos[0] + gripperLength * Math.cos(gripperAngle + gripperWidth / 60),
+                        endPos[1] - gripperLength * Math.sin(gripperAngle + gripperWidth / 60)
+                    );
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(endPos[0], endPos[1]);
+                    ctx.lineTo(
+                        endPos[0] + gripperLength * Math.cos(gripperAngle - gripperWidth / 60),
+                        endPos[1] - gripperLength * Math.sin(gripperAngle - gripperWidth / 60)
+                    );
+                    ctx.stroke();
+
+                    requestAnimationFrame(drawRobot);
+                };
+
+                drawRobot();
+            }, [robotState, flexAmount]);
+
+            return (
+                <div className="w-full h-screen bg-gray-900 text-white p-4 flex gap-4">
+                    <div className="flex-1 flex flex-col gap-4">
+                        <div className="bg-gray-800 rounded-lg p-4 flex-1">
+                            <h2 className="text-xl font-bold mb-2">3D Hand Model</h2>
+                            <canvas ref={hand3DRef} width={800} height={600} className="w-full h-full bg-gray-900 rounded" />
+                            <div className="mt-2 text-sm text-gray-400">
+                                Flex: {(flexAmount * 100).toFixed(0)}% | Position: ({handPosition[0].toFixed(1)}, {handPosition[1].toFixed(1)})
+                            </div>
+                        </div>
+
+                        {webcamActive && (
+                            <div className="bg-gray-800 rounded-lg p-4">
+                                <h3 className="font-semibold mb-2">Webcam View</h3>
+                                <div className="relative">
+                                    <video ref={videoRef} className="hidden" />
+                                    <canvas ref={handCanvasRef} width={640} height={480} className="w-full rounded border-2 border-blue-500" />
+                                    {handDetected && (
+                                        <div className="absolute top-2 left-2 bg-green-500 text-white px-3 py-1 rounded">
+                                            Hand Detected ✋
+                                        </div>
+                                    )}
+                                </div>
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="flex-1 flex flex-col gap-4">
+                        <div className="bg-gray-800 rounded-lg p-4 flex-1">
+                            <h2 className="text-xl font-bold mb-2">Robot Arm</h2>
+                            <canvas ref={robotCanvasRef} width={600} height={450} className="w-full h-full bg-gray-900 rounded" />
+                        </div>
+
+                        <div className="bg-gray-800 rounded-lg p-4">
+                            <h2 className="text-xl font-bold mb-3">Controls</h2>
+                            <button
+                                onClick={() => setWebcamActive(!webcamActive)}
+                                className={`w-full p-3 rounded font-semibold mb-3 ${
+                                    webcamActive ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'
+                                }`}
+                            >
+                                {webcamActive ? 'Stop Hand Tracking' : 'Start Hand Tracking'}
+                            </button>
+
+                            <div className="grid grid-cols-2 gap-2">
+                                <button
+                                    onClick={() => setSystemState(prev => ({ ...prev, clutched: !prev.clutched }))}
+                                    className={`p-2 rounded ${systemState.clutched ? 'bg-yellow-600' : 'bg-gray-600 hover:bg-gray-700'}`}
+                                >
+                                    {systemState.clutched ? 'Clutched' : 'Clutch'}
+                                </button>
+                                <button
+                                    onClick={() => {
+                                        setRobotState({ joints: [0,0,0,0,0,0], cartesian: {x:0,y:200,z:300}, gripperOpen: 50 });
+                                        basePositionRef.current = null;
+                                    }}
+                                    className="p-2 rounded bg-blue-600 hover:bg-blue-700"
+                                >
+                                    Reset
+                                </button>
+                            </div>
+
+                            <div className="mt-4 space-y-2 text-sm">
+                                <div className="flex justify-between">
+                                    <span>Status:</span>
+                                    <span className="text-green-400 font-bold">{systemState.status}</span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span>Hand:</span>
+                                    <span className={handDetected ? 'text-green-400' : 'text-gray-400'}>
+                                        {handDetected ? 'Detected' : 'Not Found'}
+                                    </span>
+                                </div>
+                                <div className="flex justify-between">
+                                    <span>Gripper:</span>
+                                    <span>{robotState.gripperOpen.toFixed(0)}%</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        ReactDOM.render(<HandTracking3D />, document.getElementById('root'));
+    </script>
+</body>
+</html>
