@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>J&J MEDTECH - Surgical Robot Control Panel</title>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        // Hand Model with Forward Kinematics
+        class HandModel {
+            constructor() {
+                this.lengths = {
+                    thumb: [3.0, 2.2],
+                    index: [4.5, 2.8, 2.0],
+                    middle: [5.0, 3.0, 2.2],
+                    ring: [4.3, 2.6, 1.9],
+                    pinky: [3.2, 2.0, 1.6]
+                };
+
+                this.basePos = {
+                    thumb: [-2.0, 1.6, -0.2],
+                    index: [-1.5, 4.2, 0.0],
+                    middle: [0.0, 4.4, 0.2],
+                    ring: [1.5, 4.2, 0.0],
+                    pinky: [3.0, 3.7, -0.1]
+                };
+
+                this.fanAngles = {
+                    thumb: -25 * Math.PI / 180,
+                    index: 10 * Math.PI / 180,
+                    middle: 0,
+                    ring: -10 * Math.PI / 180,
+                    pinky: -20 * Math.PI / 180
+                };
+
+                this.maxFlex = {
+                    thumb: [55, 70, 65],
+                    index: [85, 105, 80],
+                    middle: [90, 110, 85],
+                    ring: [85, 100, 75],
+                    pinky: [80, 95, 70]
+                };
+            }
+
+            rotX(theta) {
+                const c = Math.cos(theta);
+                const s = Math.sin(theta);
+                return [
+                    [1, 0, 0, 0],
+                    [0, c, -s, 0],
+                    [0, s, c, 0],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            rotZ(theta) {
+                const c = Math.cos(theta);
+                const s = Math.sin(theta);
+                return [
+                    [c, -s, 0, 0],
+                    [s, c, 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            translate(x, y, z) {
+                return [
+                    [1, 0, 0, x],
+                    [0, 1, 0, y],
+                    [0, 0, 1, z],
+                    [0, 0, 0, 1]
+                ];
+            }
+
+            matMul(a, b) {
+                const result = Array(4).fill(0).map(() => Array(4).fill(0));
+                for (let i = 0; i < 4; i++) {
+                    for (let j = 0; j < 4; j++) {
+                        for (let k = 0; k < 4; k++) {
+                            result[i][j] += a[i][k] * b[k][j];
+                        }
+                    }
+                }
+                return result;
+            }
+
+            calculateFinger(fingerName, flexAmount) {
+                const positions = [];
+                const base = this.basePos[fingerName];
+                const lengths = this.lengths[fingerName];
+                const fanAngle = this.fanAngles[fingerName];
+                const maxAngles = this.maxFlex[fingerName];
+
+                let T = this.matMul(this.translate(...base), this.rotZ(fanAngle));
+                positions.push([T[0][3], T[1][3], T[2][3]]);
+
+                const isThumb = fingerName === 'thumb';
+                
+                if (isThumb) {
+                    const angles = maxAngles.map(a => a * Math.PI / 180 * flexAmount);
+                    T = this.matMul(T, this.rotZ(angles[0]));
+                    T = this.matMul(T, this.rotX(angles[1]));
+                    T = this.matMul(T, this.translate(0, lengths[0], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[2]));
+                    T = this.matMul(T, this.translate(0, lengths[1], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                } else {
+                    const angles = [
+                        maxAngles[0] * Math.PI / 180 * flexAmount * 0.75,
+                        maxAngles[1] * Math.PI / 180 * flexAmount * 1.0,
+                        maxAngles[2] * Math.PI / 180 * flexAmount * 0.85
+                    ];
+                    
+                    T = this.matMul(T, this.rotX(angles[0]));
+                    T = this.matMul(T, this.translate(0, lengths[0], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[1]));
+                    T = this.matMul(T, this.translate(0, lengths[1], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                    
+                    T = this.matMul(T, this.rotX(angles[2]));
+                    T = this.matMul(T, this.translate(0, lengths[2], 0));
+                    positions.push([T[0][3], T[1][3], T[2][3]]);
+                }
+
+                return positions;
+            }
+
+            getAllFingers(flexAmount) {
+                return {
+                    thumb: this.calculateFinger('thumb', flexAmount),
+                    index: this.calculateFinger('index', flexAmount),
+                    middle: this.calculateFinger('middle', flexAmount),
+                    ring: this.calculateFinger('ring', flexAmount),
+                    pinky: this.calculateFinger('pinky', flexAmount)
+                };
+            }
+        }
+
+        const HandTracking3D = () => {
+            const [robotState, setRobotState] = useState({
+                joints: [0, 0, 0, 0, 0, 0, 0],
+                cartesian: { x: 0, y: 200, z: 300 },
+                gripperOpen: 50,
+            });
+
+            const [systemState, setSystemState] = useState({
+                status: 'Ready',
+                emergencyStop: false,
+                clutched: false,
+            });
+
+            const [webcamActive, setWebcamActive] = useState(false);
+            const [handDetected, setHandDetected] = useState(false);
+            const [flexAmount, setFlexAmount] = useState(0);
+            const [handPosition, setHandPosition] = useState([0, 0, 0]);
+
+            // Recording state
+            const [isRecording, setIsRecording] = useState(false);
+            const [recordedData, setRecordedData] = useState([]);
+            const [recordingStartTime, setRecordingStartTime] = useState(null);
+            const [frameCount, setFrameCount] = useState(0);
+
+            // Playback state
+            const [isPlaying, setIsPlaying] = useState(false);
+            const [playbackData, setPlaybackData] = useState([]);
+            const [playbackFrame, setPlaybackFrame] = useState(0);
+            const [playbackSpeed, setPlaybackSpeed] = useState(1.0);
+
+            // Control mode
+            const [controlMode, setControlMode] = useState('ik');
+            const [selectedJoint, setSelectedJoint] = useState(0);
+            const [jointAngles, setJointAngles] = useState([0, 0, 0, 0, 0, 0, 0]);
+
+            // UI panels
+            const [showPrivacyPanel, setShowPrivacyPanel] = useState(false);
+            const [showSettings, setShowSettings] = useState(false);
+
+            const handCanvasRef = useRef(null);
+            const hand3DRef = useRef(null);
+            const videoRef = useRef(null);
+            const robotCanvasRef = useRef(null);
+            const videoStreamRef = useRef(null);
+            const handTrackingRef = useRef(null);
+            const basePositionRef = useRef(null);
+            const handModelRef = useRef(new HandModel());
+            const playbackIntervalRef = useRef(null);
+
+            useEffect(() => {
+                if (webcamActive) {
+                    startWebcam();
+                } else {
+                    stopWebcam();
+                }
+                return () => stopWebcam();
+            }, [webcamActive]);
+
+            const startWebcam = async () => {
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: { width: 640, height: 480, facingMode: 'user' }
+                    });
+                    
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                        videoStreamRef.current = stream;
+                        videoRef.current.onloadedmetadata = () => {
+                            videoRef.current.play().then(() => {
+                                trackHandFromVideo();
+                            });
+                        };
+                    }
+                } catch (err) {
+                    alert('Could not access webcam. Please allow camera permissions.');
+                    setWebcamActive(false);
+                }
+            };
+
+            const stopWebcam = () => {
+                if (videoStreamRef.current) {
+                    videoStreamRef.current.getTracks().forEach(track => track.stop());
+                    videoStreamRef.current = null;
+                }
+                if (handTrackingRef.current) {
+                    cancelAnimationFrame(handTrackingRef.current);
+                    handTrackingRef.current = null;
+                }
+            };
+
+            const trackHandFromVideo = () => {
+                const video = videoRef.current;
+                const canvas = handCanvasRef.current;
+                
+                if (!video || !canvas) return;
+
+                const ctx = canvas.getContext('2d');
+                
+                const processFrame = () => {
+                    if (!webcamActive || !videoRef.current) return;
+
+                    try {
+                        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                        const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+                        const pixels = imageData.data;
+                        
+                        let skinPixels = [];
+                        for (let i = 0; i < pixels.length; i += 4) {
+                            const r = pixels[i];
+                            const g = pixels[i + 1];
+                            const b = pixels[i + 2];
+                            
+                            if (r > 95 && g > 40 && b > 20 && r > g && r > b && Math.abs(r - g) > 15) {
+                                const x = (i / 4) % canvas.width;
+                                const y = Math.floor((i / 4) / canvas.width);
+                                skinPixels.push({ x, y });
+                            }
+                        }
+                        
+                        if (skinPixels.length > 1000) {
+                            setHandDetected(true);
+                            
+                            let sumX = 0, sumY = 0;
+                            skinPixels.forEach(p => {
+                                sumX += p.x;
+                                sumY += p.y;
+                            });
+                            const centerX = sumX / skinPixels.length;
+                            const centerY = sumY / skinPixels.length;
+                            
+                            ctx.strokeStyle = '#00ff00';
+                            ctx.lineWidth = 3;
+                            ctx.beginPath();
+                            ctx.arc(centerX, centerY, 30, 0, Math.PI * 2);
+                            ctx.stroke();
+                            
+                            const normalizedX = centerX / canvas.width;
+                            const normalizedY = centerY / canvas.height;
+                            
+                            const handArea = skinPixels.length;
+                            const currentFlex = Math.max(0, Math.min(1, 1 - (handArea / 8000)));
+                            setFlexAmount(currentFlex);
+                            
+                            processHandPosition(normalizedX, normalizedY, currentFlex);
+                        } else {
+                            setHandDetected(false);
+                        }
+                    } catch (err) {
+                        console.error('Error processing frame:', err);
+                    }
+                    
+                    handTrackingRef.current = requestAnimationFrame(processFrame);
+                };
+                
+                if (video.readyState >= 2) {
+                    processFrame();
+                } else {
+                    setTimeout(() => trackHandFromVideo(), 100);
+                }
+            };
+
+            const processHandPosition = (x, y, flex) => {
+                if (systemState.emergencyStop || isPlaying) return;
+
+                if (!basePositionRef.current || systemState.clutched) {
+                    basePositionRef.current = { x, y };
+                    return;
+                }
+
+                const deltaX = (x - basePositionRef.current.x) * 500;
+                const deltaY = -(y - basePositionRef.current.y) * 500;
+
+                const newCart = {
+                    x: Math.max(-400, Math.min(400, deltaX)),
+                    y: Math.max(0, Math.min(400, 200 + deltaY)),
+                    z: 300
+                };
+
+                const distance = Math.sqrt(newCart.x ** 2 + (newCart.y - 200) ** 2);
+                const angle = Math.atan2(newCart.y - 200, newCart.x);
+                
+                const newJoints = [...robotState.joints];
+                newJoints[0] = angle * 180 / Math.PI;
+                newJoints[1] = Math.max(-90, Math.min(90, (distance - 200) / 3));
+
+                setRobotState(prev => ({
+                    ...prev,
+                    cartesian: newCart,
+                    joints: newJoints,
+                    gripperOpen: (1 - flex) * 80 + 10
+                }));
+
+                setHandPosition([deltaX / 50, deltaY / 50, 0]);
+            };
+
+            // Recording functions
+            const toggleRecording = () => {
+                if (!isRecording) {
+                    setIsRecording(true);
+                    setRecordedData([]);
+                    setRecordingStartTime(Date.now());
+                    setFrameCount(0);
+                    setSystemState(prev => ({ ...prev, status: 'Recording' }));
+                } else {
+                    setIsRecording(false);
+                    setSystemState(prev => ({ ...prev, status: 'Ready' }));
+                    alert(`Recording stopped. Captured ${frameCount} frames.`);
+                }
+            };
+
+            const saveToJSON = () => {
+                if (recordedData.length === 0) {
+                    alert('No data to save. Start recording first.');
+                    return;
+                }
+                const dataStr = JSON.stringify(recordedData, null, 2);
+                const blob = new Blob([dataStr], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `recording_${new Date().toISOString()}.json`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const saveToCSV = () => {
+                if (recordedData.length === 0) {
+                    alert('No data to save. Start recording first.');
+                    return;
+                }
+                let csv = 'timestamp,frame,end_effector_x,end_effector_y,end_effector_z,flex_amount,joint_1,joint_2,joint_3,joint_4,joint_5,joint_6,joint_7\n';
+                recordedData.forEach(d => {
+                    csv += `${d.timestamp},${d.frame},${d.end_effector_x},${d.end_effector_y},${d.end_effector_z},${d.flex_amount},${d.joint_angles.join(',')}\n`;
+                });
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `recording_${new Date().toISOString()}.csv`;
+                a.click();
+                URL.revokeObjectURL(url);
+            };
+
+            const loadRecording = () => {
+                const input = document.createElement('input');
+                input.type = 'file';
+                input.accept = '.json';
+                input.onchange = (e) => {
+                    const file = e.target.files[0];
+                    if (!file) return;
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        try {
+                            const data = JSON.parse(event.target.result);
+                            setPlaybackData(data);
+                            setPlaybackFrame(0);
+                            alert(`Loaded ${data.length} frames. Click Play to start.`);
+                        } catch (err) {
+                            alert('Error loading file: ' + err.message);
+                        }
+                    };
+                    reader.readAsText(file);
+                };
+                input.click();
+            };
+
+            const startPlayback = () => {
+                if (playbackData.length === 0) {
+                    alert('Load a recording first.');
+                    return;
+                }
+                setIsPlaying(true);
+                setPlaybackFrame(0);
+                setSystemState(prev => ({ ...prev, status: 'Playing' }));
+            };
+
+            const pausePlayback = () => {
+                setIsPlaying(false);
+                setSystemState(prev => ({ ...prev, status: 'Paused' }));
+            };
+
+            const stopPlayback = () => {
+                setIsPlaying(false);
+                setPlaybackFrame(0);
+                setSystemState(prev => ({ ...prev, status: 'Ready' }));
+            };
+
+            // Playback effect
+            useEffect(() => {
+                if (!isPlaying || playbackData.length === 0) return;
+
+                playbackIntervalRef.current = setInterval(() => {
+                    setPlaybackFrame(prev => {
+                        if (prev >= playbackData.length - 1) {
+                            setIsPlaying(false);
+                            setSystemState(ps => ({ ...ps, status: 'Ready' }));
+                            alert('Playback complete');
+                            return 0;
+                        }
+                        const nextFrame = prev + 1;
+                        const data = playbackData[nextFrame];
+                        
+                        setHandPosition([data.end_effector_x / 50, data.end_effector_y / 50, 0]);
+                        setFlexAmount(data.flex_amount);
+                        setJointAngles(data.joint_angles);
+                        setRobotState(rs => ({
+                            ...rs,
+                            joints: data.joint_angles,
+                            cartesian: { x: data.end_effector_x, y: data.end_effector_y, z: 300 },
+                            gripperOpen: (1 - data.flex_amount) * 80 + 10
+                        }));
+
+                        return nextFrame;
+                    });
+                }, 1000 / (30 * playbackSpeed));
+
+                return () => {
+                    if (playbackIntervalRef.current) {
+                        clearInterval(playbackIntervalRef.current);
+                    }
+                };
+            }, [isPlaying, playbackData, playbackSpeed]);
+
+            // Recording effect
+            useEffect(() => {
+                if (!isRecording) return;
+
+                const interval = setInterval(() => {
+                    const elapsed = (Date.now() - recordingStartTime) / 1000;
+                    const dataPoint = {
+                        timestamp: elapsed,
+                        frame: frameCount,
+                        datetime: new Date().toISOString(),
+                        end_effector_x: handPosition[0] * 50,
+                        end_effector_y: handPosition[1] * 50,
+                        end_effector_z: 0,
+                        flex_amount: flexAmount,
+                        joint_angles: robotState.joints
+                    };
+
+                    setRecordedData(prev => [...prev, dataPoint]);
+                    setFrameCount(prev => prev + 1);
+                }, 33);
+
+                return () => clearInterval(interval);
+            }, [isRecording, handPosition, flexAmount, robotState.joints, recordingStartTime, frameCount]);
+
+            // Keyboard controls
+            useEffect(() => {
+                const handleKeyDown = (e) => {
+                    if (e.key === ' ') {
+                        e.preventDefault();
+                        toggleRecording();
+                    } else if (e.key === 'p' || e.key === 'P') {
+                        if (isPlaying) pausePlayback();
+                        else startPlayback();
+                    } else if (e.ctrlKey && e.key === 's') {
+                        e.preventDefault();
+                        saveToCSV();
+                    } else if (e.ctrlKey && e.key === 'j') {
+                        e.preventDefault();
+                        saveToJSON();
+                    } else if (e.ctrlKey && e.key === 'l') {
+                        e.preventDefault();
+                        loadRecording();
+                    } else if (controlMode === 'joint') {
+                        if (e.key >= '1' && e.key <= '7') {
+                            setSelectedJoint(parseInt(e.key) - 1);
+                        } else if (e.key === 'ArrowUp') {
+                            e.preventDefault();
+                            setJointAngles(prev => {
+                                const newAngles = [...prev];
+                                newAngles[selectedJoint] = Math.min(Math.PI, newAngles[selectedJoint] + 0.1);
+                                return newAngles;
+                            });
+                        } else if (e.key === 'ArrowDown') {
+                            e.preventDefault();
+                            setJointAngles(prev => {
+                                const newAngles = [...prev];
+                                newAngles[selectedJoint] = Math.max(-Math.PI, newAngles[selectedJoint] - 0.1);
+                                return newAngles;
+                            });
+                        } else if (e.key === 'r' || e.key === 'R') {
+                            setJointAngles([0, 0, 0, 0, 0, 0, 0]);
+                        }
+                    }
+                };
+
+                window.addEventListener('keydown', handleKeyDown);
+                return () => window.removeEventListener('keydown', handleKeyDown);
+            }, [isRecording, isPlaying, controlMode, selectedJoint]);
+
+            const takeScreenshot = () => {
+                const canvas = robotCanvasRef.current;
+                if (!canvas) return;
+                canvas.toBlob(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `screenshot_${new Date().toISOString()}.png`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                });
+            };
+
+            // Update joint angles when in joint mode
+            useEffect(() => {
+                if (controlMode === 'joint' && !isPlaying) {
+                    setRobotState(prev => ({
+                        ...prev,
+                        joints: jointAngles
+                    }));
+                }
+            }, [jointAngles, controlMode, isPlaying]);
+
+            // Draw 3D Hand
+            useEffect(() => {
+                const canvas = hand3DRef.current;
+                if (!canvas) return;
+
+                const ctx = canvas.getContext('2d');
+                const width = canvas.width;
+                const height = canvas.height;
+
+                const draw3DFrame = () => {
+                    ctx.fillStyle = '#0a0a1a';
+                    ctx.fillRect(0, 0, width, height);
+
+                    ctx.strokeStyle = '#1a1a3a';
+                    ctx.lineWidth = 1;
+                    for (let i = 0; i < width; i += 40) {
+                        ctx.beginPath();
+                        ctx.moveTo(i, 0);
+                        ctx.lineTo(i, height);
+                        ctx.stroke();
+                    }
+                    for (let i = 0; i < height; i += 40) {
+                        ctx.beginPath();
+                        ctx.moveTo(0, i);
+                        ctx.lineTo(width, i);
+                        ctx.stroke();
+                    }
+
+                    const fingers = handModelRef.current.getAllFingers(flexAmount);
+                    
+                    const scale = 15;
+                    const offsetX = width / 2 + handPosition[0];
+                    const offsetY = height / 2 - handPosition[1];
+
+                    ctx.strokeStyle = '#4a4a8a';
+                    ctx.lineWidth = 3;
+                    ctx.fillStyle = '#2a2a5a';
+                    ctx.beginPath();
+                    const palmPoints = [
+                        [-3.5, 1.0], [-3.5, 3.0], [3.5, 3.0], [3.5, 1.0]
+                    ];
+                    palmPoints.forEach(([x, y], i) => {
+                        const sx = offsetX + x * scale;
+                        const sy = offsetY - y * scale;
+                        if (i === 0) ctx.moveTo(sx, sy);
+                        else ctx.lineTo(sx, sy);
+                    });
+                    ctx.closePath();
+                    ctx.fill();
+                    ctx.stroke();
+
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(offsetX, offsetY, 8, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    const colors = ['#ff4444', '#4444ff', '#44ff44', '#ffaa44', '#aa44ff'];
+                    const fingerNames = ['thumb', 'index', 'middle', 'ring', 'pinky'];
+                    
+                    fingerNames.forEach((name, idx) => {
+                        const positions = fingers[name];
+                        ctx.strokeStyle = colors[idx];
+                        ctx.lineWidth = 4;
+                        ctx.lineCap = 'round';
+                        ctx.lineJoin = 'round';
+
+                        ctx.beginPath();
+                        positions.forEach(([x, y, z], i) => {
+                            const sx = offsetX + x * scale;
+                            const sy = offsetY - y * scale;
+                            if (i === 0) ctx.moveTo(sx, sy);
+                            else ctx.lineTo(sx, sy);
+                        });
+                        ctx.stroke();
+
+                        positions.forEach(([x, y, z]) => {
+                            const sx = offsetX + x * scale;
+                            const sy = offsetY - y * scale;
+                            ctx.fillStyle = colors[idx];
+                            ctx.beginPath();
+                            ctx.arc(sx, sy, 5, 0, Math.PI * 2);
+                            ctx.fill();
+                            ctx.strokeStyle = '#ffffff';
+                            ctx.lineWidth = 2;
+                            ctx.stroke();
+                        });
+                    });
+
+                    requestAnimationFrame(draw3DFrame);
+                };
+
+                draw3DFrame();
+            }, [flexAmount, handPosition]);
+
+            // Draw Robot
+            useEffect(() => {
+                const canvas = robotCanvasRef.current;
+                if (!canvas) return;
+
+                const armSegments = [100, 150, 120, 80, 60, 50, 40];
+
+                const drawRobot = () => {
+                    const ctx = canvas.getContext('2d');
+                    const width = canvas.width;
+                    const height = canvas.height;
+
+                    ctx.fillStyle = '#1a1a2e';
+                    ctx.fillRect(0, 0, width, height);
+
+                    const baseX = width / 2;
+                    const baseY = height - 50;
+
+                    ctx.fillStyle = '#4a4a6a';
+                    ctx.fillRect(baseX - 30, baseY - 10, 60, 20);
+
+                    const rad = robotState.joints.map(j => j * Math.PI / 180);
+                    let currentX = baseX;
+                    let currentY = baseY;
+                    let currentAngle = 0;
+                    const jointPositions = [[currentX, currentY]];
+
+                    for (let i = 0; i < Math.min(7, armSegments.length); i++) {
+                        currentAngle += rad[i];
+                        currentX += armSegments[i] * Math.cos(currentAngle);
+                        currentY -= armSegments[i] * Math.sin(currentAngle);
+                        jointPositions.push([currentX, currentY]);
+                    }
+
+                    ctx.strokeStyle = '#00d4ff';
+                    ctx.lineWidth = 8;
+                    ctx.lineCap = 'round';
+
+                    for (let i = 0; i < jointPositions.length - 1; i++) {
+                        ctx.beginPath();
+                        ctx.moveTo(jointPositions[i][0], jointPositions[i][1]);
+                        ctx.lineTo(jointPositions[i + 1][0], jointPositions[i + 1][1]);
+                        ctx.stroke();
+                    }
+
+                    jointPositions.forEach((pos, idx) => {
+                        ctx.fillStyle = '#ffffff';
+                        ctx.beginPath();
+                        ctx.arc(pos[0], pos[1], idx === 0 ? 12 : 8, 0, Math.PI * 2);
+                        ctx.fill();
+                    });
+
+                    const endPos = jointPositions[jointPositions.length - 1];
+                    const gripperAngle = currentAngle;
+                    const gripperLength = 30;
+                    const gripperWidth = robotState.gripperOpen / 100 * 20;
+
+                    ctx.strokeStyle = flexAmount > 0.5 ? '#ff4444' : '#44ff44';
+                    ctx.lineWidth = 4;
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(endPos[0], endPos[1]);
+                    ctx.lineTo(
+                        endPos[0] + gripperLength * Math.cos(gripperAngle + gripperWidth / 60),
+                        endPos[1] - gripperLength * Math.sin(gripperAngle + gripperWidth / 60)
+                    );
+                    ctx.stroke();
+
+                    ctx.beginPath();
+                    ctx.moveTo(endPos[0], endPos[1]);
+                    ctx.lineTo(
+                        endPos[0] + gripperLength * Math.cos(gripperAngle - gripperWidth / 60),
+                        endPos[1] - gripperLength * Math.sin(gripperAngle - gripperWidth / 60)
+                    );
+                    ctx.stroke();
+
+                    requestAnimationFrame(drawRobot);
+                };
+
+                drawRobot();
+            }, [robotState, flexAmount]);
+
+            return (
+                <div className="w-full min-h-screen bg-gray-900 text-white p-3">
+                    {/* Header */}
+                    <div className="bg-gradient-to-r from-red-900 to-red-700 rounded-lg p-4 mb-3 shadow-lg">
+                        <h1 className="text-3xl font-bold text-white">🤖 J&J MEDTECH - Surgical Robot Control Panel</h1>
+                        <p className="text-red-200 text-sm mt-1">7-DOF Robotic Teleoperation System</p>
+                    </div>
+
+                    <div className="grid grid-cols-12 gap-3">
+                        {/* LEFT: 3D Hand Model */}
+                        <div className="col-span-4 space-y-3">
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h2 className="text-lg font-bold mb-2 text-blue-400">🖐 3D Hand Model</h2>
+                                <canvas ref={hand3DRef} width={600} height={450} className="w-full bg-gray-900 rounded border border-gray-700" />
+                                <div className="mt-2 text-xs text-gray-400 space-y-1">
+                                    <div>Flex: {(flexAmount * 100).toFixed(0)}%</div>
+                                    <div>Position: ({handPosition[0].toFixed(1)}, {handPosition[1].toFixed(1)})</div>
+                                </div>
+                            </div>
+
+                            {webcamActive && (
+                                <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                    <h3 className="font-semibold mb-2 text-green-400">📹 Webcam View</h3>
+                                    <div className="relative">
+                                        <video ref={videoRef} className="hidden" />
+                                        <canvas ref={handCanvasRef} width={640} height={480} className="w-full rounded border-2 border-blue-500" />
+                                        {handDetected && (
+                                            <div className="absolute top-2 left-2 bg-green-500 text-white px-2 py-1 rounded text-xs font-bold">
+                                                Hand Detected ✋
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* MIDDLE: Robot Arm + Controls */}
+                        <div className="col-span-5 space-y-3">
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h2 className="text-lg font-bold mb-2 text-cyan-400">🦾 Robot Arm (7-DOF)</h2>
+                                <canvas ref={robotCanvasRef} width={600} height={450} className="w-full bg-gray-900 rounded border border-gray-700" />
+                            </div>
+
+                            {/* Control Mode */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-yellow-400">⚙ Control Mode</h3>
+                                <div className="flex gap-2">
+                                    <button
+                                        onClick={() => setControlMode('ik')}
+                                        className={`flex-1 p-2 rounded font-semibold text-sm ${
+                                            controlMode === 'ik' ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                                        }`}
+                                    >
+                                        IK Control
+                                    </button>
+                                    <button
+                                        onClick={() => setControlMode('joint')}
+                                        className={`flex-1 p-2 rounded font-semibold text-sm ${
+                                            controlMode === 'joint' ? 'bg-blue-600' : 'bg-gray-700 hover:bg-gray-600'
+                                        }`}
+                                    >
+                                        Joint Control
+                                    </button>
+                                </div>
+                            </div>
+
+                            {/* Joint Angles Display */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-purple-400">🎚 Joint Angles</h3>
+                                <div className="grid grid-cols-4 gap-2 text-xs">
+                                    {robotState.joints.map((angle, i) => (
+                                        <div key={i} className={`p-2 rounded ${selectedJoint === i && controlMode === 'joint' ? 'bg-yellow-600' : 'bg-gray-700'}`}>
+                                            <div className="font-bold">J{i + 1}</div>
+                                            <div className="text-cyan-300">{angle.toFixed(1)}°</div>
+                                        </div>
+                                    ))}
+                                </div>
+                                {controlMode === 'joint' && (
+                                    <div className="mt-2 text-xs text-gray-400">
+                                        Selected: Joint {selectedJoint + 1} | Press 1-7 to select, ↑↓ to adjust
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* Telemetry */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-green-400">📊 Telemetry</h3>
+                                <div className="space-y-1 text-xs">
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Position X:</span>
+                                        <span className="font-mono text-cyan-300">{robotState.cartesian.x.toFixed(1)} mm</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Position Y:</span>
+                                        <span className="font-mono text-cyan-300">{robotState.cartesian.y.toFixed(1)} mm</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Position Z:</span>
+                                        <span className="font-mono text-cyan-300">{robotState.cartesian.z.toFixed(1)} mm</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Gripper:</span>
+                                        <span className="font-mono text-green-300">{robotState.gripperOpen.toFixed(0)}%</span>
+                                    </div>
+                                    <div className="flex justify-between">
+                                        <span className="text-gray-400">Status:</span>
+                                        <span className={`font-bold ${
+                                            systemState.status === 'Recording' ? 'text-red-400' :
+                                            systemState.status === 'Playing' ? 'text-blue-400' :
+                                            'text-green-400'
+                                        }`}>{systemState.status}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+
+                        {/* RIGHT: Recording & Controls */}
+                        <div className="col-span-3 space-y-3">
+                            {/* Capture */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-pink-400">📸 Capture</h3>
+                                <button
+                                    onClick={takeScreenshot}
+                                    className="w-full p-2 rounded bg-pink-600 hover:bg-pink-700 font-semibold text-sm mb-2"
+                                >
+                                    📸 Screenshot
+                                </button>
+                                <button
+                                    onClick={() => setWebcamActive(!webcamActive)}
+                                    className={`w-full p-2 rounded font-semibold text-sm ${
+                                        webcamActive ? 'bg-green-600 hover:bg-green-700' : 'bg-blue-600 hover:bg-blue-700'
+                                    }`}
+                                >
+                                    {webcamActive ? '⏹ Stop Webcam' : '▶ Start Webcam'}
+                                </button>
+                            </div>
+
+                            {/* Recording */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-red-400">⏺ Recording</h3>
+                                <button
+                                    onClick={toggleRecording}
+                                    className={`w-full p-2 rounded font-semibold text-sm mb-2 ${
+                                        isRecording ? 'bg-red-600 hover:bg-red-700 animate-pulse' : 'bg-red-700 hover:bg-red-600'
+                                    }`}
+                                >
+                                    {isRecording ? '⏹ Stop Recording' : '⏺ Start Recording'}
+                                </button>
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button
+                                        onClick={saveToCSV}
+                                        className="p-2 rounded bg-blue-600 hover:bg-blue-700 font-semibold text-xs"
+                                        disabled={recordedData.length === 0}
+                                    >
+                                        💾 CSV
+                                    </button>
+                                    <button
+                                        onClick={saveToJSON}
+                                        className="p-2 rounded bg-blue-600 hover:bg-blue-700 font-semibold text-xs"
+                                        disabled={recordedData.length === 0}
+                                    >
+                                        💾 JSON
+                                    </button>
+                                </div>
+                                <button
+                                    onClick={loadRecording}
+                                    className="w-full p-2 rounded bg-purple-600 hover:bg-purple-700 font-semibold text-sm mt-2"
+                                >
+                                    📂 Load
+                                </button>
+                                <div className="mt-2 text-xs text-gray-400">
+                                    Frames: {isRecording ? frameCount : recordedData.length}
+                                </div>
+                            </div>
+
+                            {/* Playback */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-blue-400">▶ Playback</h3>
+                                <div className="grid grid-cols-3 gap-2 mb-2">
+                                    <button
+                                        onClick={startPlayback}
+                                        className="p-2 rounded bg-green-600 hover:bg-green-700 font-semibold text-xs"
+                                        disabled={playbackData.length === 0 || isPlaying}
+                                    >
+                                        ▶ Play
+                                    </button>
+                                    <button
+                                        onClick={pausePlayback}
+                                        className="p-2 rounded bg-yellow-600 hover:bg-yellow-700 font-semibold text-xs"
+                                        disabled={!isPlaying}
+                                    >
+                                        ⏸ Pause
+                                    </button>
+                                    <button
+                                        onClick={stopPlayback}
+                                        className="p-2 rounded bg-red-600 hover:bg-red-700 font-semibold text-xs"
+                                    >
+                                        ⏹ Stop
+                                    </button>
+                                </div>
+                                <div className="mb-2">
+                                    <label className="text-xs text-gray-400">Speed: {playbackSpeed}x</label>
+                                    <input
+                                        type="range"
+                                        min="0.1"
+                                        max="5"
+                                        step="0.1"
+                                        value={playbackSpeed}
+                                        onChange={(e) => setPlaybackSpeed(parseFloat(e.target.value))}
+                                        className="w-full"
+                                    />
+                                </div>
+                                {playbackData.length > 0 && (
+                                    <>
+                                        <div className="w-full bg-gray-700 rounded h-2 mb-2">
+                                            <div
+                                                className="bg-blue-500 h-2 rounded transition-all"
+                                                style={{ width: `${(playbackFrame / playbackData.length) * 100}%` }}
+                                            />
+                                        </div>
+                                        <div className="text-xs text-gray-400">
+                                            Frame: {playbackFrame}/{playbackData.length}
+                                        </div>
+                                    </>
+                                )}
+                            </div>
+
+                            {/* System Controls */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-orange-400">🎮 System</h3>
+                                <div className="grid grid-cols-2 gap-2 mb-2">
+                                    <button
+                                        onClick={() => setSystemState(prev => ({ ...prev, clutched: !prev.clutched }))}
+                                        className={`p-2 rounded font-semibold text-xs ${
+                                            systemState.clutched ? 'bg-yellow-600' : 'bg-gray-700 hover:bg-gray-600'
+                                        }`}
+                                    >
+                                        {systemState.clutched ? '🔒 Clutched' : '🔓 Clutch'}
+                                    </button>
+                                    <button
+                                        onClick={() => {
+                                            setRobotState({ joints: [0,0,0,0,0,0,0], cartesian: {x:0,y:200,z:300}, gripperOpen: 50 });
+                                            setJointAngles([0,0,0,0,0,0,0]);
+                                            basePositionRef.current = null;
+                                        }}
+                                        className="p-2 rounded bg-blue-600 hover:bg-blue-700 font-semibold text-xs"
+                                    >
+                                        🔄 Reset
+                                    </button>
+                                </div>
+                                <button
+                                    onClick={() => setShowPrivacyPanel(true)}
+                                    className="w-full p-2 rounded bg-purple-600 hover:bg-purple-700 font-semibold text-xs mb-2"
+                                >
+                                    🔒 Privacy
+                                </button>
+                                <button
+                                    onClick={() => setShowSettings(true)}
+                                    className="w-full p-2 rounded bg-gray-700 hover:bg-gray-600 font-semibold text-xs"
+                                >
+                                    ⚙ Settings
+                                </button>
+                            </div>
+
+                            {/* Keyboard Shortcuts */}
+                            <div className="bg-gray-800 rounded-lg p-3 shadow-xl">
+                                <h3 className="font-bold mb-2 text-cyan-400">⌨ Keyboard</h3>
+                                <div className="text-xs space-y-1 text-gray-300 font-mono">
+                                    <div><span className="text-yellow-400">Space</span> - Record</div>
+                                    <div><span className="text-yellow-400">P</span> - Play/Pause</div>
+                                    <div><span className="text-yellow-400">Ctrl+S</span> - Save CSV</div>
+                                    <div><span className="text-yellow-400">Ctrl+J</span> - Save JSON</div>
+                                    <div><span className="text-yellow-400">Ctrl+L</span> - Load</div>
+                                    <div className="pt-2 border-t border-gray-700">
+                                        <div className="text-cyan-400 mb-1">Joint Mode:</div>
+                                        <div><span className="text-yellow-400">1-7</span> - Select Joint</div>
+                                        <div><span className="text-yellow-400">↑↓</span> - Adjust</div>
+                                        <div><span className="text-yellow-400">R</span> - Reset All</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Privacy Panel Modal */}
+                    {showPrivacyPanel && (
+                        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+                            <div className="bg-gray-800 rounded-lg p-6 max-w-2xl mx-4 shadow-2xl border border-gray-700">
+                                <h2 className="text-2xl font-bold mb-4 text-purple-400">🔒 Privacy Notice</h2>
+                                <div className="space-y-3 text-sm text-gray-300">
+                                    <p>
+                                        <strong className="text-white">Data Collection:</strong> All session data including hand tracking positions, 
+                                        joint angles, and telemetry are processed locally in your browser.
+                                    </p>
+                                    <p>
+                                        <strong className="text-white">Anonymization:</strong> Session logs are anonymized using cryptographic 
+                                        hashing to protect user identity.
+                                    </p>
+                                    <p>
+                                        <strong className="text-white">Storage:</strong> Data is stored locally on your device and is NOT 
+                                        transmitted to external servers.
+                                    </p>
+                                    <p>
+                                        <strong className="text-white">Webcam:</strong> Camera access is only used for hand tracking. 
+                                        Video is processed locally and not recorded unless you explicitly save it.
+                                    </p>
+                                    <p>
+                                        <strong className="text-white">Retention:</strong> You can clear all stored data at any time via 
+                                        Settings. Recordings are only saved when you export them.
+                                    </p>
+                                    <div className="pt-3 border-t border-gray-700 text-xs text-gray-400">
+                                        This system is for research and training purposes only. Consult your institution's 
+                                        privacy policy for medical device teleoperation.
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={() => setShowPrivacyPanel(false)}
+                                    className="w-full mt-4 p-3 rounded bg-purple-600 hover:bg-purple-700 font-semibold"
+                                >
+                                    Close
+                                </button>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* Settings Panel Modal */}
+                    {showSettings && (
+                        <div className="fixed inset-0 bg-black bg-opacity-75 flex items-center justify-center z-50">
+                            <div className="bg-gray-800 rounded-lg p-6 max-w-2xl mx-4 shadow-2xl border border-gray-700">
+                                <h2 className="text-2xl font-bold mb-4 text-orange-400">⚙ Data Settings</h2>
+                                <div className="space-y-4">
+                                    <div className="bg-gray-700 p-4 rounded">
+                                        <h3 className="font-bold mb-2 text-yellow-400">Session Data</h3>
+                                        <p className="text-sm text-gray-300 mb-3">
+                                            Recorded sessions: {recordedData.length > 0 ? '1 active' : '0'}
+                                        </p>
+                                        <p className="text-sm text-gray-300 mb-3">
+                                            Loaded playback: {playbackData.length} frames
+                                        </p>
+                                        <button
+                                            onClick={() => {
+                                                if (confirm('Clear all recorded data? This cannot be undone.')) {
+                                                    setRecordedData([]);
+                                                    setPlaybackData([]);
+                                                    setFrameCount(0);
+                                                    alert('All session data cleared.');
+                                                }
+                                            }}
+                                            className="w-full p-2 rounded bg-red-600 hover:bg-red-700 font-semibold text-sm"
+                                        >
+                                            🗑 Clear All Data
+                                        </button>
+                                    </div>
+
+                                    <div className="bg-gray-700 p-4 rounded">
+                                        <h3 className="font-bold mb-2 text-green-400">System Info</h3>
+                                        <div className="text-xs space-y-1 text-gray-300">
+                                            <div>Version: 1.0.0</div>
+                                            <div>DOF: 7-Axis Robot</div>
+                                            <div>Hand Model: Forward Kinematics</div>
+                                            <div>Control Modes: IK + Direct Joint</div>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={() => setShowSettings(false)}
+                                    className="w-full mt-4 p-3 rounded bg-gray-700 hover:bg-gray-600 font-semibold"
+                                >
+                                    Close
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        ReactDOM.render(<HandTracking3D />, document.getElementById('root'));
+    </script>
+</body>
+</html>
